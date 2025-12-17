@@ -19,3 +19,7 @@ TO AUTO RENEW NGINX CERTS BY CRONJOB (Every 12 hours) as root run:
 crontab -e
 
 0 */12 * * * /path/to/cert_manager.sh --renew nginx >> /var/log/letsencrypt/$(date +\%Y\%m\%d).log 2>&1
+
+
+
+NOTE: Port 80 is only opened to allow LetsEncrypt queries and it is closed once renewal process is completed.
