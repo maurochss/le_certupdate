@@ -1,4 +1,4 @@
-## le_certupdate ##
+# le_certupdate #
 
 Usage: ./cert_manager.sh [--debug] [OPTIONS]
 
