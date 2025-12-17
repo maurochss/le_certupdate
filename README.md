@@ -1,3 +1,5 @@
+#le_certupdate#
+
 Usage: ./cert_manager.sh [--debug] [OPTIONS]
 
   --debug            Enable debug
