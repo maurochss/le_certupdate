@@ -1,4 +1,4 @@
-#le_certupdate#
+# le_certupdate #
 
 Usage: ./cert_manager.sh [--debug] [OPTIONS]
 
@@ -15,5 +15,5 @@ TO AUTO RENEW NGINX CERTS BY CRONJOB (Every 12 hours) as root run:
 
 
 Crontab installation
-0 */12 * * * /path/to/cert_manager.sh --renew --nginx >> /var/log/letsencrypt/$(date +\%Y\%m\%d).log 2>&1
+0 */12 * * * /path/to/cert_manager.sh --renew nginx >> /var/log/letsencrypt/$(date +\%Y\%m\%d).log 2>&1
 
