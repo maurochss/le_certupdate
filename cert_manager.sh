@@ -42,8 +42,7 @@ open_port_80() {
       ;;
     Linux)
       if command -v firewall-cmd &>/dev/null; then
-        firewall-cmd --add-port=80/tcp --permanent
-        firewall-cmd --reload
+        firewall-cmd --add-port=80/tcp --timeout 5m
       elif command -v ufw &>/dev/null; then
         ufw allow 80/tcp
       elif command -v iptables &>/dev/null; then
@@ -66,8 +65,7 @@ close_port_80() {
       ;;
     Linux)
       if command -v firewall-cmd &>/dev/null; then
-        firewall-cmd --remove-port=80/tcp --permanent
-        firewall-cmd --reload
+        firewall-cmd --remove-port=80/tcp
       elif command -v ufw &>/dev/null; then
         ufw delete allow 80/tcp
       elif command -v iptables &>/dev/null; then
@@ -99,7 +97,7 @@ issue_certificate() {
 #######################################################################
 # Renew all certificates
 renew_all() {
-  $CERTBOT renew -q
+  $CERTBOT renew --webroot --webroot-path "$WEBROOT_PATH" --agree-tos -m "$EMAIL" --agree-tos -m "$EMAIL"
 }
 #######################################################################
 # Renew a specific certificate
@@ -110,7 +108,7 @@ renew_domain() {
     exit 1
   fi
 
-  $CERTBOT renew -q --cert-name "$domain"
+  $CERTBOT renew --cert-name "$domain" --webroot --webroot-path "$WEBROOT_PATH" --agree-tos -m "$EMAIL"
 }
 #######################################################################
 # Renew certificates for NGINX server_names
@@ -123,7 +121,7 @@ renew_nginx() {
   local domains=$(grep -h "server_name" $NGINX_ENABLED/* | awk '{print $2}' | tr -d ';')
   for domain in $domains; do
     echo "Renewing certificate for $domain..."
-    $CERTBOT renew -q --cert-name "$domain"
+    $CERTBOT renew --cert-name "$domain" --webroot --webroot-path "$WEBROOT_PATH" --agree-tos -m "$EMAIL"
   done
 }
 #######################################################################
