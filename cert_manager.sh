@@ -32,22 +32,46 @@ crontab -e
 EOF
 }
 #######################################################################
+# Get the network interface that has the default gateway
+get_default_iface() {
+  case "$OS" in
+    OpenBSD)
+      if command -v route &>/dev/null; then
+        route -n show | awk '/^default/ {print $NF; exit}'
+      else
+        netstat -rn | awk '/^default/ {print $NF; exit}'
+      fi
+      ;;
+    Linux)
+      ip route show default | awk 'NR==1 {print $5}'
+      ;;
+  esac
+}
+#######################################################################
 # Detect the OS and open port 80
 open_port_80() {
-  echo "Opening port 80..."
+  local iface
+  iface=$(get_default_iface)
+  if [ -z "$iface" ]; then
+    echo "Could not determine default gateway interface. Aborting."
+    exit 1
+  fi
+  echo "Opening port 80 on interface $iface..."
   case "$OS" in
     OpenBSD)
       cp "$PF_CONF" "$PF_CONF_TEMP"
-      echo "pass in on em0 proto tcp from any to any port 80" | tee -a $PF_CONF_TEMP
+      echo "pass in on $iface proto tcp from any to any port 80" | tee -a "$PF_CONF_TEMP"
       pfctl -f "$PF_CONF_TEMP"
       ;;
     Linux)
       if command -v firewall-cmd &>/dev/null; then
-        firewall-cmd --add-port=80/tcp --timeout 5m
+        local zone
+        zone=$(firewall-cmd --get-zone-of-interface="$iface" 2>/dev/null || echo "public")
+        firewall-cmd --zone="$zone" --add-port=80/tcp --timeout=5m
       elif command -v ufw &>/dev/null; then
-        ufw allow 80/tcp
+        ufw allow in on "$iface" to any port 80 proto tcp
       elif command -v iptables &>/dev/null; then
-        iptables -A INPUT -p tcp --dport 80 -j ACCEPT
+        iptables -A INPUT -i "$iface" -p tcp --dport 80 -j ACCEPT
       fi
       ;;
     *)
@@ -59,18 +83,26 @@ open_port_80() {
 #######################################################################
 # Close port 80
 close_port_80() {
-  echo "Closing port 80..."
+  local iface
+  iface=$(get_default_iface)
+  if [ -z "$iface" ]; then
+    echo "Warning: could not determine default gateway interface. Port 80 may still be open."
+    return 1
+  fi
+  echo "Closing port 80 on interface $iface..."
   case "$OS" in
     OpenBSD)
       pfctl -f "$PF_CONF"
       ;;
     Linux)
       if command -v firewall-cmd &>/dev/null; then
-        firewall-cmd --remove-port=80/tcp
+        local zone
+        zone=$(firewall-cmd --get-zone-of-interface="$iface" 2>/dev/null || echo "public")
+        firewall-cmd --zone="$zone" --remove-port=80/tcp
       elif command -v ufw &>/dev/null; then
-        ufw delete allow 80/tcp
+        ufw delete allow in on "$iface" to any port 80 proto tcp
       elif command -v iptables &>/dev/null; then
-        iptables -D INPUT -p tcp --dport 80 -j ACCEPT
+        iptables -D INPUT -i "$iface" -p tcp --dport 80 -j ACCEPT
       fi
       ;;
     *)
