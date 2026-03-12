@@ -13,9 +13,10 @@
 # Print help
 print_help() {
   cat <<EOF
-Usage: ./cert_manager.sh [--debug] [OPTIONS]
+Usage: ./cert_manager.sh [--debug] [--standalone] [OPTIONS]
 
   --debug            Enable debug
+  --standalone       Use certbot standalone mode instead of webroot (for servers without a web server)
 
 Options:
   --new DOMAIN            Issue a new certificate for the specified DOMAIN.
@@ -36,9 +37,9 @@ open_port_80() {
   echo "Opening port 80..."
   case "$OS" in
     OpenBSD)
-      cp $PF_CONF $PF_CONF_TEMP
+      cp "$PF_CONF" "$PF_CONF_TEMP"
       echo "pass in on em0 proto tcp from any to any port 80" | tee -a $PF_CONF_TEMP
-      pfctl -f $PF_CONF_TEMP
+      pfctl -f "$PF_CONF_TEMP"
       ;;
     Linux)
       if command -v firewall-cmd &>/dev/null; then
@@ -61,7 +62,7 @@ close_port_80() {
   echo "Closing port 80..."
   case "$OS" in
     OpenBSD)
-      pfctl -f $PF_CONF
+      pfctl -f "$PF_CONF"
       ;;
     Linux)
       if command -v firewall-cmd &>/dev/null; then
@@ -87,17 +88,17 @@ issue_certificate() {
     exit 1
   fi
 
-  if [ -z "$(dig $domain +short)" ]; then
+  if [ -z "$(dig "$domain" +short)" ]; then
     echo "No DNS record found for $domain. Verify the domain is registered."
     exit 1
   fi
 
-  $CERTBOT -v certonly -d "$domain" --webroot --webroot-path "$WEBROOT_PATH" --agree-tos -m "$EMAIL"
+  $CERTBOT -v certonly -d "$domain" "${CERTBOT_AUTH[@]}" "${CERTBOT_HOOKS[@]}" --agree-tos -m "$EMAIL"
 }
 #######################################################################
 # Renew all certificates
 renew_all() {
-  $CERTBOT renew --webroot --webroot-path "$WEBROOT_PATH" --agree-tos -m "$EMAIL" --agree-tos -m "$EMAIL"
+  $CERTBOT renew "${CERTBOT_AUTH[@]}" "${CERTBOT_HOOKS[@]}" --agree-tos -m "$EMAIL"
 }
 #######################################################################
 # Renew a specific certificate
@@ -108,7 +109,7 @@ renew_domain() {
     exit 1
   fi
 
-  $CERTBOT renew --cert-name "$domain" --webroot --webroot-path "$WEBROOT_PATH" --agree-tos -m "$EMAIL"
+  $CERTBOT renew --cert-name "$domain" "${CERTBOT_AUTH[@]}" "${CERTBOT_HOOKS[@]}" --agree-tos -m "$EMAIL"
 }
 #######################################################################
 # Renew certificates for NGINX server_names
@@ -118,17 +119,21 @@ renew_nginx() {
     exit 1
   fi
 
-  local domains=$(grep -h "server_name" $NGINX_ENABLED/* | awk '{print $2}' | tr -d ';')
+  local domains=$(grep -h "server_name" "$NGINX_ENABLED"/* | awk '{print $2}' | tr -d ';')
   for domain in $domains; do
     echo "Renewing certificate for $domain..."
-    $CERTBOT renew --cert-name "$domain" --webroot --webroot-path "$WEBROOT_PATH" --agree-tos -m "$EMAIL"
+    $CERTBOT renew --cert-name "$domain" "${CERTBOT_AUTH[@]}" "${CERTBOT_HOOKS[@]}" --agree-tos -m "$EMAIL"
   done
 }
 #######################################################################
 ### MAIN
 #######################################################################
-# Set up trap to ensure port 80 is closed on exit or error
+# Set up traps to ensure port 80 is closed on exit or crash.
+# Signal traps call exit so the EXIT trap fires once and handles cleanup.
 trap 'close_port_80' EXIT
+trap 'exit 130' INT   # Ctrl+C (SIGINT)
+trap 'exit 143' TERM  # kill (SIGTERM)
+trap 'exit 129' HUP   # terminal closed (SIGHUP)
 
 SETTINGS_FILE="$(dirname "$0")/.$(basename "$0" .sh).env"
 
@@ -137,8 +142,8 @@ then
   echo "Missing $SETTINGS_FILE"
   exit 1
 else
-  source $SETTINGS_FILE
-  if [ -z $EMAIL ]
+  source "$SETTINGS_FILE"
+  if [ -z "$EMAIL" ]
   then
     echo "Missing e-mail address. Add the bellow variable in $SETTINGS_FILE"
     echo "remenber to replce myemail@mydomain.com with your e-mail address."
@@ -157,6 +162,26 @@ fi
 if [ ! -d "$LOG_PATH" ]; then
   mkdir -p "$LOG_PATH"
 fi
+
+STANDALONE=false
+ARGS=()
+for arg in "$@"; do
+  case "$arg" in
+    --standalone) STANDALONE=true ;;
+    --debug) set -x ;;
+    *) ARGS+=("$arg") ;;
+  esac
+done
+set -- "${ARGS[@]}"
+
+if $STANDALONE; then
+  CERTBOT_AUTH=(--standalone)
+else
+  CERTBOT_AUTH=(--webroot --webroot-path "$WEBROOT_PATH")
+fi
+
+RENEWLIST_FILE="${LOG_PATH}${DATE}-renewlist.log"
+CERTBOT_HOOKS=(--deploy-hook "basename \$RENEWED_LINEAGE >> $RENEWLIST_FILE")
 
 if [ $# -eq 0 ]; then
   print_help
@@ -196,18 +221,20 @@ case "$1" in
     exit 1
     ;;
 esac
-# Check if Any certificate was renewed so that we can reload NGINX
-if [ `cat /var/log/letsencrypt/letsencrypt.log  |grep ^"$(date +'%Y-%m-%d %H')" |grep "Congratulations, all renewals succeeded" |wc -l` -gt 0 ]
-then
-  echo "Some certificates have been updated. Reloading NGINX....."
-  nginx -s reload
-  sleep 1
+# Run post-renewal actions if any certificates were renewed
+ACTIONS_SCRIPT="$(dirname "$0")/update_actions.sh"
+if [ -f "$RENEWLIST_FILE" ] && [ "$(wc -l < "$RENEWLIST_FILE")" -gt 0 ]; then
+  echo "Certificates renewed. Running post-renewal actions..."
+  if [ -f "$ACTIONS_SCRIPT" ]; then
+    "$ACTIONS_SCRIPT" "$RENEWLIST_FILE" "$SETTINGS_FILE"
+  else
+    echo "Warning: $ACTIONS_SCRIPT not found. Skipping post-renewal actions."
+  fi
 else
-  echo "No certs updated. No reload required."
+  echo "No certs updated. No actions required."
 fi
 # Clean up old logs
 echo "Deleting logs older than 10 days..."
-find "$LOG_PATH" -type f -mtime "+"$LOG_RETENTION_DAYS -exec rm -fv {} \;
+find "$LOG_PATH" -type f -mtime "+""$LOG_RETENTION_DAYS" -exec rm -fv {} \;
 
 echo "Done. Logs can be found at $LOG_FILE"
-
