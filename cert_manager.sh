@@ -16,14 +16,18 @@ print_help() {
 Usage: ./cert_manager.sh [--debug] [--standalone] [OPTIONS]
 
   --debug            Enable debug
-  --standalone       Use certbot standalone mode instead of webroot (for servers without a web server)
+  --standalone       Use certbot standalone mode instead of webroot (global default)
 
 Options:
-  --new DOMAIN            Issue a new certificate for the specified DOMAIN.
-  --renew all             Renew all certificates.
-  --renew domain DOMAIN   Renew the certificate for the specified DOMAIN.
-  --renew nginx           Renew certificates for all server_names in NGINX config.
-  -h, --help              Display this help message.
+  --new DOMAIN[,METHOD]            Issue a new certificate for the specified DOMAIN.
+  --renew all                      Renew all certificates.
+  --renew domain DOMAIN[,METHOD]   Renew the certificate for the specified DOMAIN.
+  --renew nginx                    Renew certificates for all server_names in NGINX config.
+  -h, --help                       Display this help message.
+
+Per-domain METHOD (appended with ',' to the domain name):
+  s or S    standalone  (e.g. vpn.example.com,s)
+  w or W    webroot     (e.g. www.example.com,w  — same as omitting the suffix)
 
 TO AUTO RENEW NGINX CERTS BY CRONJOB (Every 12 hours) as root run:
 
@@ -56,6 +60,7 @@ open_port_80() {
     echo "Could not determine default gateway interface. Aborting."
     exit 1
   fi
+  PORT_80_OPENED=true
   echo "Opening port 80 on interface $iface..."
   case "$OS" in
     OpenBSD)
@@ -83,6 +88,7 @@ open_port_80() {
 #######################################################################
 # Close port 80
 close_port_80() {
+  $PORT_80_OPENED || return 0
   local iface
   iface=$(get_default_iface)
   if [ -z "$iface" ]; then
@@ -112,9 +118,59 @@ close_port_80() {
   esac
 }
 #######################################################################
+# Resolve a method letter (S/W) to PARSED_AUTH array
+_apply_method() {
+  case "${1,,}" in
+    s|standalone)
+      PARSED_AUTH=(--standalone)
+      ;;
+    w|webroot)
+      PARSED_AUTH=(--webroot --webroot-path "$WEBROOT_PATH")
+      ;;
+    *)
+      echo "Unknown renewal method '$1'. Use 'S' for standalone or 'W' for webroot."
+      exit 1
+      ;;
+  esac
+}
+
+# Parse "domain[,method]" — sets PARSED_DOMAIN and PARSED_AUTH.
+# Resolution order:
+#   1. Inline CLI suffix  (domain,S / domain,W)
+#   2. RENEWALL_METHOD array from env  ("domain,S")
+#   3. DEFAULT_RENEWALL_METHOD from env
+#   4. Webroot (hardcoded fallback)
+parse_domain_method() {
+  local arg="$1"
+  if [[ "$arg" == *,* ]]; then
+    PARSED_DOMAIN="${arg%,*}"
+    _apply_method "${arg##*,}"
+    return
+  fi
+
+  PARSED_DOMAIN="$arg"
+
+  # Check per-domain env array
+  local entry
+  for entry in "${RENEWALL_METHOD[@]}"; do
+    local entry_domain="${entry%%,*}"
+    local entry_method="${entry##*,}"
+    if [ "$entry_domain" = "$PARSED_DOMAIN" ]; then
+      _apply_method "$entry_method"
+      return
+    fi
+  done
+
+  # Fall back to DEFAULT_RENEWALL_METHOD, then webroot
+  _apply_method "${DEFAULT_RENEWALL_METHOD:-W}"
+}
+#######################################################################
 # Issue a new certificate
 issue_certificate() {
-  local domain=$1
+  parse_domain_method "$1"
+  local domain="$PARSED_DOMAIN"
+  local auth=("${PARSED_AUTH[@]}")
+
   if [ -z "$domain" ]; then
     echo "Please specify a domain name for certificate issuance."
     exit 1
@@ -125,23 +181,38 @@ issue_certificate() {
     exit 1
   fi
 
-  $CERTBOT -v certonly -d "$domain" "${CERTBOT_AUTH[@]}" "${CERTBOT_HOOKS[@]}" --agree-tos -m "$EMAIL"
+  $CERTBOT -v certonly -d "$domain" "${auth[@]}" "${CERTBOT_HOOKS[@]}" --agree-tos -m "$EMAIL"
 }
 #######################################################################
 # Renew all certificates
 renew_all() {
-  $CERTBOT renew "${CERTBOT_AUTH[@]}" "${CERTBOT_HOOKS[@]}" --agree-tos -m "$EMAIL"
+  local live_dir="/etc/letsencrypt/live"
+  if [ ! -d "$live_dir" ]; then
+    echo "No certificates found at $live_dir."
+    exit 1
+  fi
+
+  for domain_dir in "$live_dir"/*/; do
+    local domain
+    domain=$(basename "$domain_dir")
+    parse_domain_method "$domain"
+    echo "Renewing certificate for $domain (method: ${PARSED_AUTH[0]})..."
+    $CERTBOT renew --cert-name "$domain" "${PARSED_AUTH[@]}" "${CERTBOT_HOOKS[@]}" --agree-tos -m "$EMAIL"
+  done
 }
 #######################################################################
 # Renew a specific certificate
 renew_domain() {
-  local domain=$1
+  parse_domain_method "$1"
+  local domain="$PARSED_DOMAIN"
+  local auth=("${PARSED_AUTH[@]}")
+
   if [ -z "$domain" ]; then
     echo "Please specify a domain name to renew its certificate."
     exit 1
   fi
 
-  $CERTBOT renew --cert-name "$domain" "${CERTBOT_AUTH[@]}" "${CERTBOT_HOOKS[@]}" --agree-tos -m "$EMAIL"
+  $CERTBOT renew --cert-name "$domain" "${auth[@]}" "${CERTBOT_HOOKS[@]}" --agree-tos -m "$EMAIL"
 }
 #######################################################################
 # Renew certificates for NGINX server_names
@@ -153,15 +224,32 @@ renew_nginx() {
 
   local domains=$(grep -h "server_name" "$NGINX_ENABLED"/* | awk '{print $2}' | tr -d ';')
   for domain in $domains; do
-    echo "Renewing certificate for $domain..."
-    $CERTBOT renew --cert-name "$domain" "${CERTBOT_AUTH[@]}" "${CERTBOT_HOOKS[@]}" --agree-tos -m "$EMAIL"
+    parse_domain_method "$domain"
+    echo "Renewing certificate for $domain (method: ${PARSED_AUTH[0]})..."
+    $CERTBOT renew --cert-name "$domain" "${PARSED_AUTH[@]}" "${CERTBOT_HOOKS[@]}" --agree-tos -m "$EMAIL"
   done
 }
 #######################################################################
 ### MAIN
 #######################################################################
+# Handle --help early, before traps or env loading.
+for _arg in "$@"; do
+  case "$_arg" in
+    -h|--help)
+      print_help
+      if [ "$(id -u)" -ne 0 ]; then
+        echo ""
+        echo "Note: This script requires root/sudo to manage firewall rules and certificates."
+      fi
+      exit 0
+      ;;
+  esac
+done
+unset _arg
+
 # Set up traps to ensure port 80 is closed on exit or crash.
 # Signal traps call exit so the EXIT trap fires once and handles cleanup.
+PORT_80_OPENED=false
 trap 'close_port_80' EXIT
 trap 'exit 130' INT   # Ctrl+C (SIGINT)
 trap 'exit 143' TERM  # kill (SIGTERM)
@@ -195,22 +283,15 @@ if [ ! -d "$LOG_PATH" ]; then
   mkdir -p "$LOG_PATH"
 fi
 
-STANDALONE=false
 ARGS=()
 for arg in "$@"; do
   case "$arg" in
-    --standalone) STANDALONE=true ;;
+    --standalone) DEFAULT_RENEWALL_METHOD=S ;;  # CLI flag overrides env default
     --debug) set -x ;;
     *) ARGS+=("$arg") ;;
   esac
 done
 set -- "${ARGS[@]}"
-
-if $STANDALONE; then
-  CERTBOT_AUTH=(--standalone)
-else
-  CERTBOT_AUTH=(--webroot --webroot-path "$WEBROOT_PATH")
-fi
 
 RENEWLIST_FILE="${LOG_PATH}${DATE}-renewlist.log"
 CERTBOT_HOOKS=(--deploy-hook "basename \$RENEWED_LINEAGE >> $RENEWLIST_FILE")
