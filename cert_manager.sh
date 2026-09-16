@@ -4,7 +4,7 @@
 #######################################################################
 ### VARIABLES
 #######################################################################
-# 
+#
 # SEE .cert_manager.env (dot cert_manager.env)
 #
 #######################################################################
@@ -20,19 +20,28 @@ Usage: ./cert_manager.sh [--debug] [--standalone] [OPTIONS]
 
 Options:
   --new DOMAIN[,METHOD]            Issue a new certificate for the specified DOMAIN.
-  --renew all                      Renew all certificates.
+  --renew all                      Renew every lineage in /etc/letsencrypt/live/.
   --renew domain DOMAIN[,METHOD]   Renew the certificate for the specified DOMAIN.
-  --renew nginx                    Renew certificates for all server_names in NGINX config.
+  --renew nginx                    Renew every NGINX server_name PLUS every domain
+                                   declared in RENEWALL_METHOD (default behaviour).
   -h, --help                       Display this help message.
 
 Per-domain METHOD (appended with ',' to the domain name):
   s or S    standalone  (e.g. vpn.example.com,s)
   w or W    webroot     (e.g. www.example.com,w  — same as omitting the suffix)
 
-TO AUTO RENEW NGINX CERTS BY CRONJOB (Every 12 hours) as root run:
+Domains that have no NGINX vhost (VPN endpoints, mail hosts, appliances) are
+picked up from the RENEWALL_METHOD array in the settings file, so they renew
+alongside the NGINX ones without needing a vhost to be discovered.
+
+Expired lineages are counted once per calendar day. After MAX_INVALID_DAYS
+distinct days they are removed with 'certbot delete' and recorded, together
+with their DNS status, in the deletion history file.
+
+TO AUTO RENEW CERTS BY CRONJOB (Every 12 hours) as root run:
 
 crontab -e
-0 */12 * * * /etc/letsencrypt/scripts/cert_manager.sh --renew --nginx >> /var/log/letsencrypt/20251217.log 2>&1
+0 */12 * * * /etc/letsencrypt/scripts/cert_manager.sh --renew nginx >> /var/log/letsencrypt/\$(date +\%Y\%m\%d)_cert_renew.log 2>&1
 EOF
 }
 #######################################################################
@@ -118,6 +127,18 @@ close_port_80() {
   esac
 }
 #######################################################################
+# True when a local process already holds TCP port 80.
+# certbot --standalone binds :80 itself, so an occupied port means failure.
+port_80_in_use() {
+  if command -v ss &>/dev/null; then
+    ss -ltn 2>/dev/null | awk '{print $4}' | grep -qE '[:.]80$'
+  elif command -v netstat &>/dev/null; then
+    netstat -ltn 2>/dev/null | awk '{print $4}' | grep -qE '[:.]80$'
+  else
+    return 1
+  fi
+}
+#######################################################################
 # Resolve a method letter (S/W) to PARSED_AUTH array
 _apply_method() {
   case "${1,,}" in
@@ -165,6 +186,163 @@ parse_domain_method() {
   _apply_method "${DEFAULT_RENEWALL_METHOD:-W}"
 }
 #######################################################################
+# True when certbot actually knows about this lineage.
+lineage_exists() {
+  [ -f "$RENEWAL_DIR/$1.conf" ] || [ -d "$LIVE_DIR/$1" ]
+}
+
+# Report whether the domain still has a DNS record.
+# Used to tell the admin whether a DNS entry needs removing after a deletion.
+dns_status() {
+  local domain="$1" answer=""
+  if command -v dig &>/dev/null; then
+    answer=$(dig +short "$domain" 2>/dev/null)
+  elif command -v host &>/dev/null; then
+    host "$domain" &>/dev/null && answer="present"
+  else
+    getent hosts "$domain" &>/dev/null && answer="present"
+  fi
+  if [ -n "$answer" ]; then echo "present"; else echo "absent"; fi
+}
+
+# True when the lineage's certificate is already past its notAfter date.
+cert_is_invalid() {
+  local cert="$LIVE_DIR/$1/cert.pem"
+  [ -f "$cert" ] || return 1
+  ! openssl x509 -checkend 0 -noout -in "$cert" &>/dev/null
+}
+
+# Drop a domain from the invalid tracker (it renewed, or it was deleted).
+clear_invalid_cert() {
+  local domain="$1"
+  [ -f "$INVALID_STATE_FILE" ] || return 0
+  grep -v "^${domain}," "$INVALID_STATE_FILE" > "${INVALID_STATE_FILE}.tmp" 2>/dev/null
+  mv "${INVALID_STATE_FILE}.tmp" "$INVALID_STATE_FILE"
+}
+
+# Remove a lineage that has been expired for MAX_INVALID_DAYS days and
+# append it to the deletion history, including whether DNS still resolves.
+delete_invalid_cert() {
+  local domain="$1" days="$2" first_seen="$3"
+  local dns note
+  dns=$(dns_status "$domain")
+  if [ "$dns" = "present" ]; then
+    note="DNS record still resolves - remove it from the DNS server"
+  else
+    note="DNS record already absent - no administrative action needed"
+  fi
+
+  echo "  Deleting $domain after $days invalid day(s) since $first_seen."
+  if $CERTBOT delete --cert-name "$domain" --non-interactive; then
+    if [ ! -s "$DELETED_HISTORY_FILE" ]; then
+      echo "# deleted_on,domain,first_invalid,days_invalid,dns_record,admin_note" > "$DELETED_HISTORY_FILE"
+    fi
+    printf '%s,%s,%s,%s,%s,%s\n' \
+      "$(date +%F)" "$domain" "$first_seen" "$days" "$dns" "$note" >> "$DELETED_HISTORY_FILE"
+    echo "  Deleted. $note"
+    clear_invalid_cert "$domain"
+  else
+    echo "  ERROR: 'certbot delete --cert-name $domain' failed. Will retry next run."
+    DELETE_FAILURES=$((DELETE_FAILURES + 1))
+  fi
+}
+
+# Count one calendar day of invalidity for a domain. The schedule may fire
+# several times a day, so the counter only advances when the date changes.
+record_invalid_cert() {
+  local domain="$1"
+  local today first_seen last_seen days found=0
+  local s_domain s_first s_last s_days
+  today=$(date +%F)
+
+  : > "${INVALID_STATE_FILE}.tmp"
+  if [ -f "$INVALID_STATE_FILE" ]; then
+    while IFS=, read -r s_domain s_first s_last s_days; do
+      [ -z "$s_domain" ] && continue
+      if [ "$s_domain" = "$domain" ]; then
+        found=1
+        first_seen="$s_first"
+        last_seen="$today"
+        if [ "$s_last" = "$today" ]; then
+          days="$s_days"
+        else
+          days=$(( s_days + 1 ))
+        fi
+        printf '%s,%s,%s,%s\n' "$domain" "$first_seen" "$last_seen" "$days" >> "${INVALID_STATE_FILE}.tmp"
+      else
+        printf '%s,%s,%s,%s\n' "$s_domain" "$s_first" "$s_last" "$s_days" >> "${INVALID_STATE_FILE}.tmp"
+      fi
+    done < "$INVALID_STATE_FILE"
+  fi
+
+  if [ "$found" -eq 0 ]; then
+    first_seen="$today"
+    days=1
+    printf '%s,%s,%s,%s\n' "$domain" "$first_seen" "$today" "$days" >> "${INVALID_STATE_FILE}.tmp"
+  fi
+  mv "${INVALID_STATE_FILE}.tmp" "$INVALID_STATE_FILE"
+
+  echo "  INVALID: $domain is expired - day $days of $MAX_INVALID_DAYS (first seen $first_seen)."
+  if [ "$days" -ge "$MAX_INVALID_DAYS" ]; then
+    if [ "${AUTO_DELETE_INVALID:-true}" = "true" ]; then
+      delete_invalid_cert "$domain" "$days" "$first_seen"
+    else
+      echo "  AUTO_DELETE_INVALID is disabled. Delete manually: $CERTBOT delete --cert-name $domain"
+    fi
+  fi
+}
+
+# Walk every lineage and update the invalid tracker. Run AFTER renewals so a
+# certificate that just renewed is no longer counted as invalid.
+sweep_invalid_certs() {
+  [ -d "$LIVE_DIR" ] || return 0
+  mkdir -p "$STATE_PATH"
+  local domain_dir domain
+  echo "Checking for expired certificates..."
+  for domain_dir in "$LIVE_DIR"/*/; do
+    [ -d "$domain_dir" ] || continue
+    domain=$(basename "$domain_dir")
+    if cert_is_invalid "$domain"; then
+      record_invalid_cert "$domain"
+    else
+      clear_invalid_cert "$domain"
+    fi
+  done
+}
+#######################################################################
+# Renew one domain. Resolves the auth method, skips unknown lineages, and
+# guards the standalone path against an occupied port 80.
+run_certbot_renew() {
+  parse_domain_method "$1"
+  local domain="$PARSED_DOMAIN"
+  local auth=("${PARSED_AUTH[@]}")
+  local hooks=("${CERTBOT_HOOKS[@]}")
+
+  if ! lineage_exists "$domain"; then
+    echo "Skipping $domain: certbot has no lineage for it (nothing to renew)."
+    return 0
+  fi
+
+  if [ "${auth[0]}" = "--standalone" ] && port_80_in_use; then
+    if [ -n "$STANDALONE_STOP_SERVICE" ]; then
+      echo "Port 80 is busy; stopping $STANDALONE_STOP_SERVICE around the standalone renewal."
+      hooks+=(--pre-hook "systemctl stop $STANDALONE_STOP_SERVICE"
+              --post-hook "systemctl start $STANDALONE_STOP_SERVICE")
+    else
+      echo "WARNING: port 80 is already in use. Standalone renewal of $domain will likely"
+      echo "         fail to bind. Set STANDALONE_STOP_SERVICE in $SETTINGS_FILE."
+    fi
+  fi
+
+  echo "Renewing certificate for $domain (method: ${auth[0]})..."
+  if $CERTBOT renew --cert-name "$domain" "${auth[@]}" "${hooks[@]}" --agree-tos -m "$EMAIL"; then
+    return 0
+  fi
+  echo "ERROR: renewal failed for $domain."
+  RENEW_FAILURES=$((RENEW_FAILURES + 1))
+  return 1
+}
+#######################################################################
 # Issue a new certificate
 issue_certificate() {
   parse_domain_method "$1"
@@ -186,48 +364,65 @@ issue_certificate() {
 #######################################################################
 # Renew all certificates
 renew_all() {
-  local live_dir="/etc/letsencrypt/live"
-  if [ ! -d "$live_dir" ]; then
-    echo "No certificates found at $live_dir."
+  if [ ! -d "$LIVE_DIR" ]; then
+    echo "No certificates found at $LIVE_DIR."
     exit 1
   fi
 
-  for domain_dir in "$live_dir"/*/; do
-    local domain
+  local domain_dir domain
+  for domain_dir in "$LIVE_DIR"/*/; do
+    [ -d "$domain_dir" ] || continue
     domain=$(basename "$domain_dir")
-    parse_domain_method "$domain"
-    echo "Renewing certificate for $domain (method: ${PARSED_AUTH[0]})..."
-    $CERTBOT renew --cert-name "$domain" "${PARSED_AUTH[@]}" "${CERTBOT_HOOKS[@]}" --agree-tos -m "$EMAIL"
+    run_certbot_renew "$domain"
   done
 }
 #######################################################################
 # Renew a specific certificate
 renew_domain() {
-  parse_domain_method "$1"
-  local domain="$PARSED_DOMAIN"
-  local auth=("${PARSED_AUTH[@]}")
-
-  if [ -z "$domain" ]; then
+  if [ -z "$1" ]; then
     echo "Please specify a domain name to renew its certificate."
     exit 1
   fi
-
-  $CERTBOT renew --cert-name "$domain" "${auth[@]}" "${CERTBOT_HOOKS[@]}" --agree-tos -m "$EMAIL"
+  run_certbot_renew "$1"
 }
 #######################################################################
-# Renew certificates for NGINX server_names
-renew_nginx() {
+# Every server_name declared in the NGINX config.
+# sites-enabled holds symlinks, so grep needs -R (not -r) to follow them.
+collect_nginx_domains() {
   if [ ! -d "$NGINX_ENABLED" ]; then
-    echo "NGINX sites-enabled directory not found."
-    exit 1
+    echo "Notice: $NGINX_ENABLED not found; using RENEWALL_METHOD entries only." >&2
+    return 0
+  fi
+  grep -RhE '^[[:space:]]*server_name[[:space:]]+' "$NGINX_ENABLED"/ 2>/dev/null \
+    | sed -E 's/^[[:space:]]*server_name[[:space:]]+//; s/;.*$//' \
+    | tr -s '[:space:]' '\n' \
+    | grep -vE '^(_|localhost)?$' \
+    | grep -v '^\*'
+}
+
+# Every domain declared in RENEWALL_METHOD. These are the hosts that have no
+# NGINX vhost to be discovered from - VPN endpoints, appliances, and the like.
+collect_env_domains() {
+  local entry
+  for entry in "${RENEWALL_METHOD[@]}"; do
+    entry="${entry%%,*}"
+    [ -n "$entry" ] && echo "$entry"
+  done
+}
+
+# Default renewal pass: NGINX server_names plus env-declared domains.
+renew_nginx() {
+  local targets domain
+  targets=$( { collect_nginx_domains; collect_env_domains; } | awk 'NF' | sort -u )
+
+  if [ -z "$targets" ]; then
+    echo "No renewal targets found in $NGINX_ENABLED or RENEWALL_METHOD."
+    return 1
   fi
 
-  local domains=$(grep -h "server_name" "$NGINX_ENABLED"/* | awk '{print $2}' | tr -d ';')
-  for domain in $domains; do
-    parse_domain_method "$domain"
-    echo "Renewing certificate for $domain (method: ${PARSED_AUTH[0]})..."
-    $CERTBOT renew --cert-name "$domain" "${PARSED_AUTH[@]}" "${CERTBOT_HOOKS[@]}" --agree-tos -m "$EMAIL"
-  done
+  while IFS= read -r domain; do
+    run_certbot_renew "$domain"
+  done <<< "$targets"
 }
 #######################################################################
 ### MAIN
@@ -255,6 +450,11 @@ trap 'exit 130' INT   # Ctrl+C (SIGINT)
 trap 'exit 143' TERM  # kill (SIGTERM)
 trap 'exit 129' HUP   # terminal closed (SIGHUP)
 
+RENEW_FAILURES=0
+DELETE_FAILURES=0
+LIVE_DIR="/etc/letsencrypt/live"
+RENEWAL_DIR="/etc/letsencrypt/renewal"
+
 SETTINGS_FILE="$(dirname "$0")/.$(basename "$0" .sh).env"
 
 if [ ! -f "$SETTINGS_FILE" ]
@@ -267,11 +467,11 @@ else
   then
     echo "Missing e-mail address. Add the bellow variable in $SETTINGS_FILE"
     echo "remenber to replce myemail@mydomain.com with your e-mail address."
-    exit
-  elif [ -z $CERTBOT ]
+    exit 1
+  elif [ -z "$CERTBOT" ]
   then
     CERTBOT=$(which certbot)
-    if [ -z "$CERTBOT" ] 
+    if [ -z "$CERTBOT" ]
     then
       echo "Missing certbot."
       exit 1
@@ -279,8 +479,19 @@ else
   fi
 fi
 
+# Expired-certificate tracking. This must NOT live under LOG_PATH: the log
+# cleanup below deletes files older than LOG_RETENTION_DAYS, which would wipe
+# a counter that has to survive MAX_INVALID_DAYS.
+STATE_PATH="${STATE_PATH:-/var/lib/cert_manager}"
+INVALID_STATE_FILE="$STATE_PATH/invalid_certs.state"
+DELETED_HISTORY_FILE="$STATE_PATH/deleted_certs.history"
+MAX_INVALID_DAYS="${MAX_INVALID_DAYS:-30}"
+
 if [ ! -d "$LOG_PATH" ]; then
   mkdir -p "$LOG_PATH"
+fi
+if [ ! -d "$STATE_PATH" ]; then
+  mkdir -p "$STATE_PATH"
 fi
 
 ARGS=()
@@ -308,7 +519,8 @@ case "$1" in
     ;;
   --renew)
     open_port_80
-    case "$2" in
+    # Accept both 'nginx' and '--nginx' spellings.
+    case "${2#--}" in
       all)
         renew_all
         ;;
@@ -324,6 +536,7 @@ case "$1" in
         exit 1
         ;;
     esac
+    sweep_invalid_certs
     ;;
   -h|--help)
     print_help
@@ -347,7 +560,13 @@ else
   echo "No certs updated. No actions required."
 fi
 # Clean up old logs
-echo "Deleting logs older than 10 days..."
-find "$LOG_PATH" -type f -mtime "+""$LOG_RETENTION_DAYS" -exec rm -fv {} \;
+echo "Deleting logs older than ${LOG_RETENTION_DAYS:-10} days..."
+find "$LOG_PATH" -type f -mtime "+${LOG_RETENTION_DAYS:-10}" -exec rm -fv {} \;
 
 echo "Done. Logs can be found at $LOG_FILE"
+
+# Surface failures to cron instead of always reporting success.
+if [ "$RENEW_FAILURES" -gt 0 ] || [ "$DELETE_FAILURES" -gt 0 ]; then
+  echo "Completed with $RENEW_FAILURES renewal failure(s) and $DELETE_FAILURES deletion failure(s)."
+  exit 1
+fi
