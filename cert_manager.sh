@@ -139,6 +139,42 @@ port_80_in_use() {
   fi
 }
 #######################################################################
+# True when an entry is a well-formed "domain,METHOD" pair.
+# Guards against settings-file damage - a stray line swallowed into the
+# RENEWALL_METHOD array must not be mistaken for a domain.
+_valid_method_entry() {
+  local entry="$1"
+  case "$entry" in
+    *,*) ;;
+    *) return 1 ;;
+  esac
+  case "${entry##*,}" in
+    [sS]|standalone|[wW]|webroot) return 0 ;;
+    *) return 1 ;;
+  esac
+}
+
+# Warn about unusable RENEWALL_METHOD entries once, at startup, instead of
+# aborting the whole run the first time the renewal loop trips over one.
+validate_settings() {
+  if ! _valid_method_entry "x,${DEFAULT_RENEWALL_METHOD:-W}"; then
+    echo "Invalid DEFAULT_RENEWALL_METHOD '${DEFAULT_RENEWALL_METHOD}'. Use 'S' or 'W'."
+    exit 1
+  fi
+  local entry
+  for entry in "${RENEWALL_METHOD[@]}"; do
+    [ -n "$entry" ] || continue
+    _valid_method_entry "$entry" && continue
+    echo "Warning: ignoring malformed RENEWALL_METHOD entry: '$entry'"
+    echo "         Expected \"domain,S\" or \"domain,W\"."
+    if [[ "$entry" == *=* ]]; then
+      echo "         That looks like a setting swallowed into the array."
+      echo "         Check for a missing ')' in $SETTINGS_FILE."
+    fi
+  done
+}
+
+#######################################################################
 # Resolve a method letter (S/W) to PARSED_AUTH array
 _apply_method() {
   case "${1,,}" in
@@ -171,9 +207,12 @@ parse_domain_method() {
 
   PARSED_DOMAIN="$arg"
 
-  # Check per-domain env array
+  # Check per-domain env array. Malformed entries are skipped: they were
+  # already reported by validate_settings and must not abort the run.
   local entry
   for entry in "${RENEWALL_METHOD[@]}"; do
+    [ -n "$entry" ] || continue
+    _valid_method_entry "$entry" || continue
     local entry_domain="${entry%%,*}"
     local entry_method="${entry##*,}"
     if [ "$entry_domain" = "$PARSED_DOMAIN" ]; then
@@ -405,8 +444,9 @@ collect_nginx_domains() {
 collect_env_domains() {
   local entry
   for entry in "${RENEWALL_METHOD[@]}"; do
-    entry="${entry%%,*}"
-    [ -n "$entry" ] && echo "$entry"
+    [ -n "$entry" ] || continue
+    _valid_method_entry "$entry" || continue
+    echo "${entry%%,*}"
   done
 }
 
@@ -478,6 +518,8 @@ else
     fi
   fi
 fi
+
+validate_settings
 
 # Expired-certificate tracking. This must NOT live under LOG_PATH: the log
 # cleanup below deletes files older than LOG_RETENTION_DAYS, which would wipe
