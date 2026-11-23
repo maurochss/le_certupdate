@@ -161,7 +161,7 @@ crontab -e
 Add the following line:
 
 ```
-0 */12 * * * /path/to/cert_manager.sh --renew nginx >> /var/log/letsencrypt/$(date +\%Y\%m\%d)_cert_renew.log 2>&1
+0 */12 * * * /path/to/cert_manager.sh --renew --nginx >> /var/log/letsencrypt/$(date +\%Y\%m\%d)_cert_renew.log 2>&1
 ```
 
 **Note:** Port 80 is opened only to allow Let's Encrypt validation and is always closed once the renewal process completes (or on script exit/crash).
