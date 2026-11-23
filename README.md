@@ -13,11 +13,20 @@ A consolidated Let's Encrypt certificate management script for Linux and OpenBSD
 
 Options:
   --new DOMAIN[,METHOD]            Issue a new certificate for DOMAIN.
-  --renew all                      Renew every lineage found in /etc/letsencrypt/live/.
+  --renew [all] [--nginx]          Renew every lineage in /etc/letsencrypt/live/ that
+                                   expires within the renewal window (--days N, default
+                                   RENEW_WITHIN_DAYS=30). With --nginx, lineages not in
+                                   use are skipped.
+  --renew nginx                    Same as '--renew all --nginx' (default behaviour).
   --renew domain DOMAIN[,METHOD]   Renew the certificate for DOMAIN.
-  --renew nginx                    Renew every NGINX server_name PLUS every domain
-                                   declared in RENEWALL_METHOD. (default behaviour)
+  --find [--nginx] [filters]       List lineages and their Not After date. Renews nothing.
   -h, --help                       Display this help message.
+
+Expiry filters (--find and --renew all|nginx; may be combined):
+  --days N | --expired | --before DATE | --after DATE | --match REGEX | --nginx
+
+--find options:
+  --format FMT | --keep | -q, --quiet | --refresh
 ```
 
 Per-domain METHOD suffix (appended with `,` to the domain name):
@@ -36,22 +45,31 @@ For every domain, the auth method is resolved in this priority order:
 3. **`DEFAULT_RENEWALL_METHOD`** — env file default (`W` = webroot, `S` = standalone)
 4. **Webroot** — hardcoded fallback if nothing is set
 
-`--renew all` reads folder names from `/etc/letsencrypt/live/` and applies this resolution per domain, so mixed standalone/webroot environments are handled correctly.
+`--renew all` reads folder names from `/etc/letsencrypt/live/` and applies this resolution per lineage, so mixed standalone/webroot environments are handled correctly.
 
 > **Note:** Webroot validation requires NGINX to be running to serve the ACME challenge files.
 
 ## Which domains get renewed
 
-`--renew nginx` is the scheduled default. It renews the **union** of two sources:
+`--renew all` and `--renew nginx` no longer hand every lineage to certbot. They first
+read each lineage's `cert.pem` expiry date locally, and only lineages expiring within
+the renewal window (`--days N`, default `RENEW_WITHIN_DAYS=30`) are passed to certbot.
+Expiry dates are cached in `$STATE_PATH/expiry.cache`, keyed by the `cert.pem` symlink
+target and mtime, so openssl only runs for certificates that changed. When nothing is
+due, certbot is never called and port 80 is never opened.
 
-1. Every `server_name` found in `$NGINX_ENABLED` (symlinks are followed; multi-name
-   directives such as `server_name a.com b.com;` yield both names; `_`, `localhost`
-   and wildcards are ignored).
-2. Every domain declared in the `RENEWALL_METHOD` array.
+With `--nginx` (or `--renew nginx`, the scheduled default) a due lineage is renewed only
+when it is **in use**, i.e. any of:
 
-Source 2 exists because hosts that terminate TLS without NGINX — VPN endpoints, mail
-servers, appliances — have no vhost to be discovered from. Declaring them in
-`RENEWALL_METHOD` is what makes them visible to the renewal pass:
+1. Its certificate is referenced by an `ssl_certificate` directive in `$NGINX_ENABLED`
+   (`.../live/<name>/...` or `.../archive/<name>/...`; symlinks are followed).
+2. Its name matches a `server_name` in `$NGINX_ENABLED` — this covers vhosts that keep
+   their `ssl_certificate` lines in an included snippet outside `$NGINX_ENABLED`.
+3. It is declared in the `RENEWALL_METHOD` array.
+
+Due lineages that are not in use are logged as skipped. Source 3 exists because hosts
+that terminate TLS without NGINX — VPN endpoints, mail servers, appliances — have no
+vhost to be discovered from:
 
 ```bash
 RENEWALL_METHOD=(
@@ -59,9 +77,21 @@ RENEWALL_METHOD=(
 )
 ```
 
-A missing `$NGINX_ENABLED` directory is a notice, not a fatal error — the env-declared
-domains still renew. A `server_name` with no corresponding certbot lineage is skipped
-with a message rather than handed to certbot.
+## Finding expiring certificates
+
+`--find` lists lineages with their Not After date and days left (negative = expired);
+`[in use]` marks lineages the `--nginx` filter would keep. It renews nothing and does not
+touch the firewall.
+
+```
+./cert_manager.sh --find --days 30 --nginx
+./cert_manager.sh --find --expired
+./cert_manager.sh --find --after 2026-10-01 --before 2026-11-01
+./cert_manager.sh --find --format %Y-%m-%d --match '^2026-12' --keep
+```
+
+`--keep` saves the list to `$STATE_PATH/results/`. `--refresh` ignores the cache.
+This replaces the former standalone `find_nginx_expired_certs.sh`.
 
 ### Standalone and port 80
 
@@ -75,7 +105,7 @@ renewals only. Left empty, the script warns when it detects an occupied port 80.
 Retired sites leave a lineage behind in `/etc/letsencrypt/` long after their vhost is
 gone, and certbot keeps failing to renew them forever. The script tracks these instead:
 
-- Every run checks each lineage's `cert.pem` with `openssl x509 -checkend 0`.
+- Every run checks each lineage's `cert.pem` expiry date (using the expiry cache).
 - An expired lineage is counted **once per calendar day**. The schedule may fire several
   times a day; the counter still advances only once.
 - After `MAX_INVALID_DAYS` distinct days (default 30) the lineage is removed with
@@ -117,6 +147,7 @@ Key variables:
 | `STATE_PATH` | Directory for the expiry counter and deletion history (must be outside `LOG_PATH`) |
 | `MAX_INVALID_DAYS` | Days a certificate may stay expired before its lineage is deleted |
 | `AUTO_DELETE_INVALID` | `true` to delete expired lineages automatically, `false` to only report |
+| `RENEW_WITHIN_DAYS` | Renewal window in days for `--renew all\|nginx` (default 30; `--days N` overrides) |
 | `STANDALONE_STOP_SERVICE` | Service stopped around standalone renewals so certbot can bind port 80 |
 
 ## Crontab installation
