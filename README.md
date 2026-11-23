@@ -158,9 +158,13 @@ To auto-renew NGINX certs every 12 hours, run as root:
 crontab -e
 ```
 
-Add the following line:
+Add the following lines. Cron runs jobs with a minimal `PATH` (typically `/usr/bin:/bin`),
+which does not include `/usr/local/bin` where `bash`, `certbot` and `nginx` are usually
+installed, nor the `sbin` directories holding `pfctl`, `firewall-cmd` and `ip`. Without the
+`PATH` line the job fails with `env: bash: No such file or directory`.
 
 ```
+PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
 0 */12 * * * /path/to/cert_manager.sh --renew --nginx >> /var/log/letsencrypt/$(date +\%Y\%m\%d)_cert_renew.log 2>&1
 ```
 

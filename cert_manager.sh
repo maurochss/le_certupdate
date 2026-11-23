@@ -67,6 +67,11 @@ with their DNS status, in the deletion history file.
 TO AUTO RENEW CERTS BY CRONJOB (Every 12 hours) as root run:
 
 crontab -e
+
+Cron runs with a minimal PATH, so set one first (bash, certbot and nginx usually
+live in /usr/local/bin; pfctl, firewall-cmd and ip in the sbin directories):
+
+PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
 0 */12 * * * /etc/letsencrypt/scripts/cert_manager.sh --renew --nginx >> /var/log/letsencrypt/\$(date +\%Y\%m\%d)_cert_renew.log 2>&1
 EOF
 }
